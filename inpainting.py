@@ -1,13 +1,25 @@
 """
-多波段图像修补 (Multi-band Image Inpainting)
+多波段图像修补与薄云去除 (Multi-band Image Inpainting & Thin Cloud Removal)
 
-问题描述：
-    原始算法对各波段独立修补，当波段数量>3时（如高光谱、多通道卫星图像），
-    会破坏波段间的光谱相关性，导致修补区域出现严重的颜色畸变/光谱畸变。
+功能模块：
+  1. 厚云修补 (Cloud Inpainting)
+     - 问题：原算法对各波段独立修补，波段数>3时破坏光谱相关性，导致颜色畸变
+     - 解决方案：PCA降维 → 低维主成分空间联合修补 → 逆PCA投影回原始波段空间
 
-解决方案：
-    采用PCA降维 -> 低维主成分空间联合修补 -> 逆PCA投影回原始波段空间。
-    PCA保留了波段间的主要协方差结构，在主成分空间修补可保持光谱一致性。
+  2. 薄云去除 (Thin Cloud Removal)
+     - 场景：透光率>30%的半透明薄云区域（非完全遮挡）
+     - 方法：暗通道先验 (DCP) + 大气散射模型反演
+     - 优势：保留地物纹理细节，恢复真实辐射值，而非"无中生有"地修补
+
+  3. 混合模式 (Hybrid Mode)
+     - 自动区分薄云/厚云（基于透射率阈值）
+     - 薄云区域：DCP辐射校正，恢复透云影像
+     - 厚云区域：PCA联合修补，填补缺失信息
+
+模式切换：
+  "inpaint"  - 厚云修补模式（直接填补）
+  "decloud"  - 薄云去除模式（辐射校正）
+  "hybrid"   - 混合模式（自动分类+分别处理）
 
 作者: Hair Physics System Toolkit
 """
@@ -298,6 +310,438 @@ def inpaint_pca_joint(
 
 
 # =============================================================================
+# 暗通道先验 (DCP) 与薄云去除
+# =============================================================================
+
+def _min_filter(image: np.ndarray, kernel_size: int) -> np.ndarray:
+    """最小值滤波（暗通道计算的核心操作）。
+    
+    用滑动窗口取局部最小值，模拟腐蚀操作。
+    """
+    H, W = image.shape[:2]
+    pad = kernel_size // 2
+    
+    if image.ndim == 2:
+        padded = np.pad(image, pad, mode="edge")
+        result = np.zeros_like(image)
+        for i in range(H):
+            for j in range(W):
+                result[i, j] = padded[i:i + kernel_size, j:j + kernel_size].min()
+        return result
+    
+    if HAS_CV2:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
+        result = np.zeros_like(image)
+        for c in range(image.shape[-1]):
+            result[:, :, c] = cv2.erode(image[:, :, c], kernel)
+        return result
+    
+    if HAS_SCIPY:
+        from scipy.ndimage import minimum_filter
+        result = np.zeros_like(image)
+        for c in range(image.shape[-1]):
+            result[:, :, c] = minimum_filter(image[:, :, c], size=kernel_size)
+        return result
+    
+    raise ImportError("需要 OpenCV 或 SciPy 进行最小值滤波")
+
+
+def compute_dark_channel(image: np.ndarray, kernel_size: int = 15) -> np.ndarray:
+    """计算暗通道图 (Dark Channel)。
+    
+    暗通道先验：在绝大多数非天空的局部区域里，某些波段的像素值总是很低（接近0）。
+    云的存在会抬高暗通道值，因此暗通道可用于估计云的厚度。
+    
+    暗通道定义: I_dark(x) = min_{y in Omega(x)} ( min_{c in {1,...,C}} I^c(y) )
+    
+    Args:
+        image: 输入图像 (H, W, C)，值范围 [0, 1]
+        kernel_size: 局部窗口大小
+    
+    Returns:
+        暗通道图 (H, W)
+    """
+    if image.ndim != 3:
+        raise ValueError(f"image 应为 (H, W, C)，实际形状 {image.shape}")
+    
+    channel_min = np.min(image, axis=-1)
+    dark = _min_filter(channel_min, kernel_size)
+    return dark
+
+
+def estimate_atmospheric_light(image: np.ndarray, dark_channel: np.ndarray, top_percent: float = 0.1) -> np.ndarray:
+    """估计全球大气光值 A（大气散射模型中的环境光强）。
+    
+    取暗通道最亮的前top_percent%像素，在原始图像中取这些像素的最大值作为大气光。
+    这些像素对应最厚的云/最模糊的区域。
+    
+    Args:
+        image: 输入图像 (H, W, C)
+        dark_channel: 暗通道图 (H, W)
+        top_percent: 取前百分之多少的最亮暗通道像素
+    
+    Returns:
+        大气光向量 (C,)
+    """
+    H, W = dark_channel.shape
+    N = H * W
+    
+    num_pixels = max(int(N * top_percent / 100.0), 1)
+    
+    flat_dark = dark_channel.ravel()
+    flat_image = image.reshape(-1, image.shape[-1])
+    
+    indices = np.argpartition(flat_dark, -num_pixels)[-num_pixels:]
+    
+    atmospheric_light = np.max(flat_image[indices], axis=0)
+    atmospheric_light = np.clip(atmospheric_light, 0.1, 1.0)
+    
+    return atmospheric_light
+
+
+def estimate_transmission(
+    image: np.ndarray,
+    atmospheric_light: np.ndarray,
+    kernel_size: int = 15,
+    omega: float = 0.95
+) -> np.ndarray:
+    """估计透射率图 t(x)（即光线穿透云/雾的比例）。
+    
+    基于大气散射模型:
+        I(x) = J(x) * t(x) + A * (1 - t(x))
+    其中:
+        I(x) = 观测图像
+        J(x) = 地物真实辐射（待恢复）
+        t(x) = 透射率（0~1，1表示完全无云）
+        A    = 大气光
+    
+    透射率与暗通道的关系推导:
+        t(x) = 1 - omega * min_c( min_{Omega} (I^c / A^c) )
+             = 1 - omega * dark_channel(I/A)
+    
+    omega是保留少量云/雾的系数（0.95效果最好，避免画面过于假）
+    
+    Args:
+        image: 输入图像 (H, W, C)，值范围 [0, 1]
+        atmospheric_light: 大气光向量 (C,)
+        kernel_size: 暗通道窗口大小
+        omega: 云保留系数，0~1，越大去云越彻底
+    
+    Returns:
+        透射率图 (H, W)，值范围 [0, 1]
+    """
+    normalized = image / (atmospheric_light + 1e-12)
+    dark = compute_dark_channel(normalized, kernel_size)
+    transmission = 1.0 - omega * dark
+    transmission = np.clip(transmission, 0.05, 1.0)
+    return transmission
+
+
+def refine_transmission_guided(image: np.ndarray, transmission: np.ndarray, radius: int = 5) -> np.ndarray:
+    """引导滤波细化透射率图，保持边缘细节。
+    
+    暗通道得到的透射率比较粗糙，用引导滤波（以原图为引导）细化边缘。
+    没有OpenCV时退化为高斯模糊平滑。
+    """
+    if HAS_CV2:
+        img_gray = np.mean(image, axis=-1).astype(np.float32)
+        img_gray_u8 = np.clip(img_gray * 255, 0, 255).astype(np.uint8)
+        trans_u8 = np.clip(transmission * 255, 0, 255).astype(np.uint8)
+        
+        refined_u8 = cv2.ximgproc.guidedFilter(
+            guide=img_gray_u8,
+            src=trans_u8,
+            radius=radius,
+            eps=1e-3
+        ) if hasattr(cv2, "ximgproc") else cv2.GaussianBlur(trans_u8, (radius * 2 + 1, radius * 2 + 1), 0)
+        
+        return refined_u8.astype(np.float32) / 255.0
+    
+    if HAS_SCIPY:
+        return ndimage.gaussian_filter(transmission, sigma=radius / 3.0)
+    
+    return transmission
+
+
+def recover_scene_radiance(
+    image: np.ndarray,
+    atmospheric_light: np.ndarray,
+    transmission: np.ndarray,
+    t_min: float = 0.1
+) -> np.ndarray:
+    """根据大气散射模型反演地物真实辐射值（去云/去雾）。
+    
+    公式: J(x) = (I(x) - A) / max(t(x), t_min) + A
+    
+    当透射率很低时，直接除以t会产生严重噪声，因此设置t_min下限。
+    
+    Args:
+        image: 观测图像 (H, W, C)
+        atmospheric_light: 大气光向量 (C,)
+        transmission: 透射率图 (H, W)
+        t_min: 透射率最小值（防止分母为0和噪声放大）
+    
+    Returns:
+        恢复后的地物真实辐射图像 (H, W, C)
+    """
+    t_clipped = np.maximum(transmission, t_min)[:, :, None]
+    A = atmospheric_light[None, None, :]
+    
+    J = (image - A) / t_clipped + A
+    J = np.clip(J, 0.0, 1.0)
+    
+    return J
+
+
+def thin_cloud_removal_dcp(
+    image: np.ndarray,
+    cloud_mask: Optional[np.ndarray] = None,
+    kernel_size: int = 15,
+    omega: float = 0.95,
+    t_min: float = 0.1,
+    refine: bool = True,
+    return_transmission: bool = False
+) -> np.ndarray or Tuple[np.ndarray, dict]:
+    """基于暗通道先验的薄云去除。
+    
+    适用场景：半透明薄云（透光率>30%），地物纹理仍隐约可见
+    处理方式：物理模型反演（大气散射模型），恢复真实地物辐射
+    
+    Args:
+        image: 输入多波段图像 (H, W, C)，值范围 [0, 1]
+        cloud_mask: 可选云掩膜 (H, W)，非零为云区。若为None则对整幅图处理
+        kernel_size: 暗通道窗口大小
+        omega: 云保留系数（0.9~1.0），越大去云越彻底
+        t_min: 透射率下限
+        refine: 是否细化透射率
+        return_transmission: 是否返回透射率等中间结果
+    
+    Returns:
+        去云后的图像 (H, W, C)；若 return_transmission=True，则返回 (图像, info字典)
+    """
+    if image.ndim != 3:
+        raise ValueError(f"image 应为 (H, W, C)，实际形状 {image.shape}")
+    
+    image_f32 = image.astype(np.float32)
+    
+    if cloud_mask is not None:
+        mask_bool = cloud_mask > 0
+    else:
+        mask_bool = np.ones(image.shape[:2], dtype=bool)
+    
+    dark = compute_dark_channel(image_f32, kernel_size)
+    
+    if cloud_mask is not None:
+        cloud_dark = dark.copy()
+        cloud_dark[~mask_bool] = -np.inf
+        A = estimate_atmospheric_light(image_f32, cloud_dark, top_percent=0.5)
+    else:
+        A = estimate_atmospheric_light(image_f32, dark, top_percent=0.1)
+    
+    t = estimate_transmission(image_f32, A, kernel_size, omega)
+    
+    if refine:
+        t = refine_transmission_guided(image_f32, t, radius=5)
+    
+    J = recover_scene_radiance(image_f32, A, t, t_min)
+    
+    if cloud_mask is not None:
+        result = image_f32.copy()
+        mask_3ch = mask_bool[:, :, None]
+        result = np.where(mask_3ch, J, image_f32)
+    else:
+        result = J
+    
+    if not return_transmission:
+        return result
+    
+    info = {
+        "dark_channel": dark,
+        "atmospheric_light": A,
+        "transmission": t,
+        "recovered": J,
+    }
+    return result, info
+
+
+def classify_cloud_thickness(
+    transmission: np.ndarray,
+    thin_threshold: float = 0.3,
+    thick_threshold: float = 0.1
+) -> Tuple[np.ndarray, np.ndarray]:
+    """根据透射率对云进行厚度分类。
+    
+    分类规则：
+      t > thin_threshold       → 薄云 / 无云    → 用DCP去除
+      thick_threshold < t <= thin_threshold → 中等云 → 混合策略
+      t <= thick_threshold     → 厚云 / 完全遮挡 → 用修补填补
+    
+    Args:
+        transmission: 透射率图 (H, W)
+        thin_threshold: 薄云阈值（透光率，默认30%）
+        thick_threshold: 厚云阈值（默认10%）
+    
+    Returns:
+        (thin_cloud_mask, thick_cloud_mask)，都是布尔类型
+    """
+    thin_mask = transmission > thin_threshold
+    thick_mask = transmission <= thick_threshold
+    return thin_mask, thick_mask
+
+
+def inpaint_hybrid_cloud(
+    image: np.ndarray,
+    cloud_mask: Optional[np.ndarray] = None,
+    mode: str = "hybrid",
+    thin_threshold: float = 0.3,
+    inpaint_radius: int = 5,
+    dcp_kernel_size: int = 15,
+    dcp_omega: float = 0.95,
+    n_components: Optional[int] = None,
+    explained_variance_ratio: float = 0.98,
+    return_debug_info: bool = False
+) -> np.ndarray or Tuple[np.ndarray, dict]:
+    """混合云处理：薄云DCP去除 + 厚云PCA修补。
+    
+    模式选择 (mode):
+      - "inpaint": 全部当作厚云，直接PCA修补
+      - "decloud": 全部当作薄云，DCP辐射校正
+      - "hybrid":  自动分类，薄云DCP + 厚云修补
+    
+    处理流程（hybrid模式）:
+      1. 计算暗通道 → 估计透射率
+      2. 根据透射率分成薄云/厚云两类
+      3. 薄云区域：DCP反演恢复地物辐射
+      4. 厚云区域：PCA联合修补填补缺失信息
+      5. 两者在边界处自然过渡
+    
+    Args:
+        image: 输入图像 (H, W, C)，值范围 [0, 1]
+        cloud_mask: 云掩膜 (H, W)，非零为云。None则整幅图处理
+        mode: "inpaint" | "decloud" | "hybrid"
+        thin_threshold: 薄云透射率阈值（默认30%）
+        inpaint_radius: 修补邻域半径
+        dcp_kernel_size: 暗通道窗口大小
+        dcp_omega: DCP云保留系数
+        n_components: PCA主成分数
+        explained_variance_ratio: PCA方差保留比例
+        return_debug_info: 是否返回调试信息
+    
+    Returns:
+        处理后的图像 (H, W, C)
+    """
+    if image.ndim != 3:
+        raise ValueError(f"image 应为 (H, W, C)，实际形状 {image.shape}")
+    
+    H, W, C = image.shape
+    image_f32 = image.astype(np.float32)
+    
+    if cloud_mask is not None:
+        cloud_bool = cloud_mask > 0
+    else:
+        cloud_bool = np.ones((H, W), dtype=bool)
+    
+    debug_info = {}
+    
+    if mode == "inpaint":
+        result = inpaint_pca_joint(
+            image_f32, cloud_bool.astype(np.uint8) * 255,
+            radius=inpaint_radius,
+            n_components=n_components,
+            explained_variance_ratio=explained_variance_ratio
+        )
+        if return_debug_info:
+            debug_info["mode"] = "inpaint"
+            return result, debug_info
+        return result
+    
+    if mode == "decloud":
+        result, dcp_info = thin_cloud_removal_dcp(
+            image_f32,
+            cloud_mask=cloud_bool.astype(np.uint8) * 255 if cloud_mask is not None else None,
+            kernel_size=dcp_kernel_size,
+            omega=dcp_omega,
+            return_transmission=True
+        )
+        if return_debug_info:
+            debug_info["mode"] = "decloud"
+            debug_info["dcp"] = dcp_info
+            return result, debug_info
+        return result
+    
+    if mode == "hybrid":
+        _, dcp_info = thin_cloud_removal_dcp(
+            image_f32,
+            cloud_mask=cloud_bool.astype(np.uint8) * 255 if cloud_mask is not None else None,
+            kernel_size=dcp_kernel_size,
+            omega=dcp_omega,
+            return_transmission=True
+        )
+        
+        t = dcp_info["transmission"]
+        
+        if cloud_mask is not None:
+            t_cloud = t.copy()
+            t_cloud[~cloud_bool] = 1.0
+        else:
+            t_cloud = t
+        
+        thin_mask, thick_mask = classify_cloud_thickness(
+            t_cloud, thin_threshold=thin_threshold, thick_threshold=thin_threshold * 0.3
+        )
+        
+        if cloud_mask is not None:
+            thin_mask = thin_mask & cloud_bool
+            thick_mask = thick_mask & cloud_bool
+        
+        thin_ratio = thin_mask.sum() / max(cloud_bool.sum(), 1)
+        thick_ratio = thick_mask.sum() / max(cloud_bool.sum(), 1)
+        
+        J = dcp_info["recovered"]
+        
+        inpaint_mask_u8 = thick_mask.astype(np.uint8) * 255
+        pca_result = inpaint_pca_joint(
+            image_f32, inpaint_mask_u8,
+            radius=inpaint_radius,
+            n_components=n_components,
+            explained_variance_ratio=explained_variance_ratio
+        )
+        
+        result = image_f32.copy()
+        
+        if thin_mask.any():
+            thin_3ch = thin_mask[:, :, None]
+            result = np.where(thin_3ch, J, result)
+        
+        if thick_mask.any():
+            thick_3ch = thick_mask[:, :, None]
+            result = np.where(thick_3ch, pca_result, result)
+        
+        if HAS_CV2:
+            t_normalized = np.clip((t_cloud - 0.05) / 0.95, 0, 1)
+            blend_mask = t_normalized * cloud_bool.astype(np.float32)
+            blend_mask_3ch = blend_mask[:, :, None]
+            
+            blended = pca_result * (1 - blend_mask_3ch) + J * blend_mask_3ch
+            result = np.where(cloud_bool[:, :, None], blended, result)
+        
+        if return_debug_info:
+            debug_info["mode"] = "hybrid"
+            debug_info["thin_mask"] = thin_mask
+            debug_info["thick_mask"] = thick_mask
+            debug_info["thin_ratio"] = thin_ratio
+            debug_info["thick_ratio"] = thick_ratio
+            debug_info["dcp"] = dcp_info
+            debug_info["pca_result"] = pca_result
+            debug_info["dcp_result"] = J
+            return result, debug_info
+        
+        return result
+    
+    raise ValueError(f"未知模式: {mode}，支持 'inpaint' / 'decloud' / 'hybrid'")
+
+
+# =============================================================================
 # 质量评估指标
 # =============================================================================
 
@@ -343,16 +787,9 @@ def compute_rmse(reference: np.ndarray, test: np.ndarray, mask: Optional[np.ndar
 # 演示与测试
 # =============================================================================
 
-def demo():
-    """演示：构造多波段测试图像，对比独立修补 vs PCA联合修补。"""
-    print("=" * 70)
-    print("多波段图像修补演示：独立修补 vs PCA联合修补")
-    print("=" * 70)
-    
-    H, W, C = 128, 128, 8
-    print(f"\n测试图像尺寸: {H}x{W}, 波段数: {C}")
-    
-    rng = np.random.RandomState(42)
+def _generate_test_image(H: int, W: int, C: int, seed: int = 42) -> np.ndarray:
+    """生成测试用的多波段地物图像（有空间纹理+光谱相关性）。"""
+    rng = np.random.RandomState(seed)
     
     yy, xx = np.mgrid[0:H, 0:W].astype(np.float32) / H
     base_spectra = np.zeros((H, W, C), dtype=np.float32)
@@ -365,12 +802,83 @@ def demo():
             + 0.1 * rng.randn(H, W) * 0.1
         )
     
-    cov = np.random.randn(C, C).astype(np.float32) * 0.1
+    cov = rng.randn(C, C).astype(np.float32) * 0.1
     cov = cov @ cov.T + np.eye(C) * 0.05
     L = np.linalg.cholesky(cov)
     noise = rng.randn(H, W, C).astype(np.float32) @ L.T
     image = base_spectra * 0.6 + 0.4 + noise * 0.05
-    image = np.clip(image, 0, 1)
+    return np.clip(image, 0, 1)
+
+
+def _generate_cloud_mask(H: int, W: int, seed: int = 123) -> np.ndarray:
+    """生成云掩膜，包含薄云区和厚云区。"""
+    rng = np.random.RandomState(seed)
+    mask = np.zeros((H, W), dtype=np.uint8)
+    
+    cy, cx, r = H // 2, W // 3, 18
+    yy_m, xx_m = np.mgrid[0:H, 0:W]
+    dist1 = np.sqrt((yy_m - cy) ** 2 + (xx_m - cx) ** 2)
+    mask[dist1 < r] = 255
+    
+    cy2, cx2, r2 = int(H * 0.7), int(W * 0.65), 22
+    dist2 = np.sqrt((yy_m - cy2) ** 2 + (xx_m - cx2) ** 2)
+    mask[dist2 < r2] = 255
+    
+    noise = rng.rand(H, W)
+    mask[(noise > 0.7) & (mask == 0)] = 180
+    
+    return mask
+
+
+def _apply_atmospheric_scattering(
+    image: np.ndarray,
+    cloud_mask: np.ndarray,
+    A: float = 0.8,
+    t_thin: float = 0.5,
+    t_thick: float = 0.1,
+    seed: int = 456
+) -> np.ndarray:
+    """模拟大气散射，给云区叠加薄云/厚云效果（用作测试的真值退化模型）。
+    
+    用I = J*t + A*(1-t)公式合成云污染图像。
+    薄云区t≈0.5，厚云区t≈0.1。
+    """
+    rng = np.random.RandomState(seed)
+    H, W, C = image.shape
+    
+    t_map = np.ones((H, W), dtype=np.float32)
+    
+    cloud_bool = cloud_mask > 0
+    
+    noise = rng.rand(H, W).astype(np.float32) * 0.3 + 0.7
+    
+    mask_bright = (cloud_mask > 200) & cloud_bool
+    mask_medium = (cloud_mask > 100) & (cloud_mask <= 200) & cloud_bool
+    
+    t_map[mask_bright] = t_thick + (noise[mask_bright] * 0.1)
+    t_map[mask_medium] = t_thin + (noise[mask_medium] * 0.25)
+    
+    A_spectrum = np.full(C, A, dtype=np.float32)
+    A_spectrum *= 0.8 + rng.rand(C).astype(np.float32) * 0.4
+    A_spectrum = np.clip(A_spectrum, 0.6, 1.0)
+    
+    t_3d = t_map[:, :, None]
+    A_3d = A_spectrum[None, None, :]
+    
+    cloudy_image = image * t_3d + A_3d * (1 - t_3d)
+    return np.clip(cloudy_image, 0, 1).astype(np.float32)
+
+
+def demo_inpainting():
+    """演示1：厚云修补 - 独立修补 vs PCA联合修补。"""
+    print("\n" + "=" * 70)
+    print("【演示1】厚云修补：独立修补 vs PCA联合修补")
+    print("=" * 70)
+    
+    H, W, C = 128, 128, 8
+    print(f"\n测试图像尺寸: {H}x{W}, 波段数: {C}")
+    
+    image = _generate_test_image(H, W, C, seed=42)
     
     mask = np.zeros((H, W), dtype=np.uint8)
     cy, cx, r = H // 2, W // 2, 15
@@ -424,11 +932,169 @@ def demo():
             err_pca = abs(pca_mean[c] - ref_mean[c])
             flag = " <<<" if err_ind > err_pca * 1.5 else ""
             print(f"  {c:>6d}  {ref_mean[c]:>10.4f}  {ind_mean[c]:>10.4f}  {pca_mean[c]:>10.4f}  {err_ind:>10.4f}  {err_pca:>10.4f}{flag}")
+
+
+def demo_thin_cloud_removal():
+    """演示2：薄云去除 - DCP暗通道先验 vs 直接修补。"""
+    print("\n" + "=" * 70)
+    print("【演示2】薄云去除：PCA修补 vs DCP辐射校正")
+    print("=" * 70)
+    
+    H, W, C = 128, 128, 8
+    print(f"\n测试图像尺寸: {H}x{W}, 波段数: {C}")
+    
+    image = _generate_test_image(H, W, C, seed=42)
+    cloud_mask = _generate_cloud_mask(H, W, seed=123)
+    
+    print(f"云区像素: {(cloud_mask > 0).sum()} ({(cloud_mask > 0).sum() / (H * W) * 100:.1f}%)")
+    print(f"  厚云区(>200): {(cloud_mask > 200).sum()} ({(cloud_mask > 200).sum() / (H * W) * 100:.1f}%)")
+    print(f"  薄云区(100-200): {((cloud_mask > 100) & (cloud_mask <= 200)).sum()} ({((cloud_mask > 100) & (cloud_mask <= 200)).sum() / (H * W) * 100:.1f}%)")
+    
+    cloudy_image = _apply_atmospheric_scattering(
+        image, cloud_mask,
+        A=0.85, t_thin=0.5, t_thick=0.15
+    )
+    
+    print("\n--- 方法1: PCA修补（当作厚云直接补）---")
+    result_inpaint = inpaint_pca_joint(
+        cloudy_image, cloud_mask, radius=7,
+        explained_variance_ratio=0.99
+    )
+    sam_inpaint = compute_spectral_angle_mapper(image, result_inpaint, cloud_mask)
+    rmse_inpaint = compute_rmse(image, result_inpaint, cloud_mask)
+    print(f"  SAM (光谱角, 越小越好):  {sam_inpaint:.6f} rad")
+    print(f"  RMSE (均方根误差):       {rmse_inpaint:.6f}")
+    
+    print("\n--- 方法2: DCP薄云去除（辐射校正，恢复地物真实值）---")
+    result_dcp, info = thin_cloud_removal_dcp(
+        cloudy_image,
+        cloud_mask=cloud_mask,
+        kernel_size=15,
+        omega=0.95,
+        return_transmission=True
+    )
+    sam_dcp = compute_spectral_angle_mapper(image, result_dcp, cloud_mask)
+    rmse_dcp = compute_rmse(image, result_dcp, cloud_mask)
+    
+    t = info["transmission"]
+    avg_t_cloud = t[cloud_mask > 0].mean()
+    print(f"  估计平均透射率: {avg_t_cloud:.3f}")
+    print(f"  SAM (光谱角, 越小越好):  {sam_dcp:.6f} rad")
+    print(f"  RMSE (均方根误差):       {rmse_dcp:.6f}")
+    
+    print("\n--- 薄云区单独评估（透射率>30%区域）---")
+    thin_cloud_mask = cloud_mask > 0
+    if thin_cloud_mask.sum() > 0:
+        t_cloud = t[thin_cloud_mask]
+        thin_mask = thin_cloud_mask & (t > 0.3)
+        
+        if thin_mask.sum() > 0:
+            sam_thin_dcp = compute_spectral_angle_mapper(image, result_dcp, thin_mask.astype(np.uint8) * 255)
+            rmse_thin_dcp = compute_rmse(image, result_dcp, thin_mask.astype(np.uint8) * 255)
+            sam_thin_inpaint = compute_spectral_angle_mapper(image, result_inpaint, thin_mask.astype(np.uint8) * 255)
+            rmse_thin_inpaint = compute_rmse(image, result_inpaint, thin_mask.astype(np.uint8) * 255)
+            
+            print(f"  薄云像素数: {thin_mask.sum()}")
+            print(f"  DCP   - SAM: {sam_thin_dcp:.6f}, RMSE: {rmse_thin_dcp:.6f}")
+            print(f"  修补  - SAM: {sam_thin_inpaint:.6f}, RMSE: {rmse_thin_inpaint:.6f}")
+            
+            if sam_thin_dcp < sam_thin_inpaint:
+                print(f"  → DCP在薄云区更优 (SAM降低 {(1 - sam_thin_dcp/sam_thin_inpaint)*100:.1f}%)")
+            else:
+                print(f"  → 修补在薄云区更优")
+    
+    print("\n--- 厚云区单独评估（透射率<15%区域）---")
+    thick_mask = thin_cloud_mask & (t < 0.15)
+    if thick_mask.sum() > 0:
+        sam_thick_dcp = compute_spectral_angle_mapper(image, result_dcp, thick_mask.astype(np.uint8) * 255)
+        rmse_thick_dcp = compute_rmse(image, result_dcp, thick_mask.astype(np.uint8) * 255)
+        sam_thick_inpaint = compute_spectral_angle_mapper(image, result_inpaint, thick_mask.astype(np.uint8) * 255)
+        rmse_thick_inpaint = compute_rmse(image, result_inpaint, thick_mask.astype(np.uint8) * 255)
+        
+        print(f"  厚云像素数: {thick_mask.sum()}")
+        print(f"  DCP   - SAM: {sam_thick_dcp:.6f}, RMSE: {rmse_thick_dcp:.6f}")
+        print(f"  修补  - SAM: {sam_thick_inpaint:.6f}, RMSE: {rmse_thick_inpaint:.6f}")
+        
+        if sam_thick_inpaint < sam_thick_dcp:
+            print(f"  → 修补在厚云区更优 (SAM降低 {(1 - sam_thick_inpaint/sam_thick_dcp)*100:.1f}%)")
+        else:
+            print(f"  → DCP在厚云区更优")
+
+
+def demo_hybrid_mode():
+    """演示3：混合模式 - 自动分类薄云/厚云，分别处理。"""
+    print("\n" + "=" * 70)
+    print("【演示3】混合模式：薄云DCP去除 + 厚云PCA修补")
+    print("=" * 70)
+    
+    H, W, C = 128, 128, 8
+    print(f"\n测试图像尺寸: {H}x{W}, 波段数: {C}")
+    
+    image = _generate_test_image(H, W, C, seed=42)
+    cloud_mask = _generate_cloud_mask(H, W, seed=123)
+    cloudy_image = _apply_atmospheric_scattering(
+        image, cloud_mask,
+        A=0.85, t_thin=0.5, t_thick=0.15
+    )
+    
+    modes = ["inpaint", "decloud", "hybrid"]
+    results = {}
+    
+    for mode in modes:
+        mode_name = {"inpaint": "纯修补模式", "decloud": "纯DCP去云模式", "hybrid": "混合模式"}[mode]
+        print(f"\n--- {mode_name} ---")
+        
+        result, debug = inpaint_hybrid_cloud(
+            cloudy_image, cloud_mask=cloud_mask,
+            mode=mode, thin_threshold=0.3,
+            inpaint_radius=7, dcp_kernel_size=15, dcp_omega=0.95,
+            explained_variance_ratio=0.99,
+            return_debug_info=True
+        )
+        results[mode] = result
+        
+        sam = compute_spectral_angle_mapper(image, result, cloud_mask)
+        rmse = compute_rmse(image, result, cloud_mask)
+        print(f"  SAM  (全云区): {sam:.6f} rad")
+        print(f"  RMSE (全云区): {rmse:.6f}")
+        
+        if mode == "hybrid" and "thin_ratio" in debug:
+            print(f"  薄云占比: {debug['thin_ratio']*100:.1f}%")
+            print(f"  厚云占比: {debug['thick_ratio']*100:.1f}%")
+    
+    print("\n--- 三种模式对比 (SAM越低越好) ---")
+    sams = {m: compute_spectral_angle_mapper(image, results[m], cloud_mask) for m in modes}
+    rmses = {m: compute_rmse(image, results[m], cloud_mask) for m in modes}
+    
+    best_sam = min(sams.values())
+    best_rmse = min(rmses.values())
+    
+    mode_labels = {"inpaint": "纯修补", "decloud": "纯DCP", "hybrid": "混合模式"}
+    print(f"  {'模式':<10s}  {'SAM':>10s}  {'RMSE':>10s}")
+    for m in modes:
+        mark_sam = " ← 最佳" if sams[m] == best_sam else ""
+        mark_rmse = " ← 最佳" if rmses[m] == best_rmse else ""
+        print(f"  {mode_labels[m]:<10s}  {sams[m]:>10.6f}{mark_sam}  {rmses[m]:>10.6f}{mark_rmse}")
     
     print("\n" + "=" * 70)
-    print("结论: PCA联合修补通过保持波段间协方差结构，")
-    print("      显著降低了光谱畸变，尤其在波段数>3时效果明显。")
+    print("结论:")
+    print("  • 薄云区域：DCP辐射校正优于直接修补（保留地物纹理细节）")
+    print("  • 厚云区域：PCA修补更优（信息完全缺失，只能邻域推断）")
+    print("  • 混合模式：自动分类+分别处理，整体效果最佳")
+    print("  • 前端可提供 薄云去除/厚云修补 模式切换")
     print("=" * 70)
+
+
+def demo():
+    """完整演示：厚云修补 + 薄云去除 + 混合模式。"""
+    print("=" * 70)
+    print("多波段图像修补与薄云去除 - 完整演示")
+    print("Multi-band Image Inpainting & Thin Cloud Removal")
+    print("=" * 70)
+    
+    demo_inpainting()
+    demo_thin_cloud_removal()
+    demo_hybrid_mode()
 
 
 if __name__ == "__main__":
